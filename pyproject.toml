@@ -1,0 +1,16 @@
+[project]
+name = "stepik-mcp"
+version = "0.1.0"
+description = "MCP server for managing Stepik courses"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dotenv = ["python-dotenv>=1.0"]
+
+[project.scripts]
+stepik-mcp = "stepik_mcp_server:mcp.run"
