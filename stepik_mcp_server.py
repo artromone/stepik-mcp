@@ -404,6 +404,7 @@ def stepik_create_quiz_step(
                     "options": options,
                     "is_always_correct": False,
                     "is_html_enabled": True,
+                    "is_options_feedback": False,
                     "preserve_order": False,
                     "is_multiple_choice": len(correct_indices) > 1,
                     "sample_size": len(choices),
@@ -414,6 +415,84 @@ def stepik_create_quiz_step(
     result = _api("POST", "step-sources", body)
     s = result["step-sources"][0]
     return f"Quiz step created: ID={s['id']} in lesson {lesson_id}"
+
+
+@mcp.tool()
+def stepik_create_free_answer_step(
+    lesson_id: int,
+    text_html: str,
+    position: int = 1,
+    manual_scoring: bool = True,
+    has_review: bool = False,
+    is_attachments_enabled: bool = False,
+    cost: int = 1,
+    max_submissions_count: int | None = 5,
+    review_criteria: list[str] | None = None,
+) -> str:
+    """
+    Create a free-answer step (open-text answer, manually reviewed).
+
+    Use for practice tasks where the student writes a free-form answer
+    (code, explanation, design) and an instructor scores by hand.
+
+    - manual_scoring=True: instructor grades each submission manually (default).
+    - has_review=True: enable peer review.
+    - is_attachments_enabled=True: allow students to attach files.
+    - cost: points awarded for the task (default 1).
+    - max_submissions_count: max attempts (default 5; None = unlimited).
+    - review_criteria: list of textual criteria for peer/manual review.
+    """
+    body = {
+        "step-source": {
+            "lesson": lesson_id,
+            "position": position,
+            "cost": cost,
+            "block": {
+                "name": "free-answer",
+                "text": text_html,
+                "source": {
+                    "is_attachments_enabled": is_attachments_enabled,
+                    "is_html_enabled": True,
+                    "manual_scoring": manual_scoring,
+                },
+            },
+        }
+    }
+    if max_submissions_count is not None:
+        body["step-source"]["max_submissions_count"] = max_submissions_count
+    if has_review:
+        body["step-source"]["has_review"] = True
+    result = _api("POST", "step-sources", body)
+    s = result["step-sources"][0]
+    source_id = s["id"]
+
+    crit_count = 0
+    if review_criteria:
+        for text in review_criteria:
+            try:
+                # criteria endpoint TBD; keeping shim so call signature works
+                _api("POST", "review-criteria", {
+                    "review-criterion": {"step_source": source_id, "text": text}
+                })
+                crit_count += 1
+            except Exception as e:
+                return (
+                    f"Free-answer step created: ID={source_id} (lesson {lesson_id}, pos {position}); "
+                    f"but failed to add review criterion: {e}"
+                )
+
+    extras = []
+    if max_submissions_count is not None:
+        extras.append(f"max_attempts={max_submissions_count}")
+    extras.append(f"cost={cost}")
+    if has_review:
+        extras.append("peer_review=on")
+    if crit_count:
+        extras.append(f"criteria={crit_count}")
+    return (
+        f"Free-answer step created: ID={source_id} in lesson {lesson_id} at position {position} "
+        f"({', '.join(extras)})"
+    )
 
 
 @mcp.tool()
