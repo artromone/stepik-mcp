@@ -39,7 +39,15 @@ mcp = FastMCP(
         "- Use stepik_get_steps to list steps in a lesson.\n"
         "- Steps are the actual content: text, video, quiz, etc.\n"
         "- Use stepik_create_* in order: course → section → lesson → unit → step.\n"
-        "Note: lesson titles are limited to 64 characters on Stepik."
+        "Note: lesson titles are limited to 64 characters on Stepik.\n\n"
+        "Grading instructor-reviewed tasks (рецензируется преподавателем):\n"
+        "- stepik_get_review_step(step_id): see the task statement, rubric criteria,\n"
+        "  max scores and how many submissions are pending.\n"
+        "- stepik_list_submissions_to_review(step_id): list pending submissions.\n"
+        "- stepik_get_submission(submission_id): one answer + statement + rubric.\n"
+        "- stepik_review_submission(submission_id, scores, feedback): grade and submit.\n"
+        "  scores is one int per criterion (0..max). This is final — the score goes\n"
+        "  to the student, so judge against the rubric before calling it."
     ),
 )
 
@@ -507,6 +515,343 @@ def stepik_delete_lesson(lesson_id: int) -> str:
     """Delete a lesson by ID."""
     _api("DELETE", f"lessons/{lesson_id}")
     return f"Lesson {lesson_id} deleted."
+
+
+# --- Review / grading -------------------------------------------------------
+#
+# Instructor-graded "review" steps (рецензируется преподавателем):
+#   step.instruction_type == "instructor"
+#   step.instruction  -> instruction with rubrics (each rubric has a `cost` = max score)
+#   step.session      -> the single instructor review-session for this step
+#
+# A student answer is a `submission` (submission.reply.text holds the answer,
+# submission.session is the student's review-session).
+#
+# Grading flow:
+#   POST  reviews            {session: <instructor_session>, submission: <id>}  -> draft review + auto rubric-scores
+#   PUT   rubric-scores/<id> {score, text}                                       -> one per rubric/criterion
+#   PUT   reviews/<id>       {text, is_frozen: true}                             -> finalize; score goes to the student
+#
+# A submission is "pending" when no frozen review references it.
+
+import re as _re
+
+
+def _strip_html(html: str) -> str:
+    """Collapse HTML to readable plain text."""
+    if not html:
+        return ""
+    text = _re.sub(r"<br\s*/?>", "\n", html, flags=_re.I)
+    text = _re.sub(r"</(p|div|li|h[1-6])>", "\n", text, flags=_re.I)
+    text = _re.sub(r"<[^>]+>", "", text)
+    text = (text.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&amp;", "&").replace("&quot;", '"')
+                .replace("&#39;", "'").replace("&nbsp;", " "))
+    text = _re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def _step_review_context(step_id: int) -> dict:
+    """Resolve instruction, rubrics, instructor session and statement for a review step."""
+    step = _api("GET", f"steps/{step_id}")["steps"][0]
+    if step.get("instruction_type") != "instructor":
+        raise RuntimeError(
+            f"Step {step_id} is not instructor-reviewed (instruction_type={step.get('instruction_type')})."
+        )
+    instruction_id = step["instruction"]
+    instructor_session = step["session"]
+    instr = _api("GET", f"instructions/{instruction_id}")
+    rubrics = sorted(instr.get("rubrics", []), key=lambda r: r.get("position", 0))
+    return {
+        "step": step,
+        "instruction_id": instruction_id,
+        "instructor_session": instructor_session,
+        "rubrics": rubrics,
+        "statement": _strip_html(step.get("block", {}).get("text", "")),
+    }
+
+
+def _instruction_review_state(instruction_id: int) -> dict:
+    """
+    Paginate all review-sessions of an instruction; map submissions and graded
+    state. A student submission counts as graded once its review-session has
+    is_taking_finished == True (a finalized instructor review). The instructor's
+    own session (submission == None) is ignored. Embedded `reviews` cannot be
+    used for this — they carry submission == None until fetched individually.
+    """
+    sessions: list = []
+    submissions: dict[int, Any] = {}
+    graded_subs: set[int] = set()
+    session_by_id: dict[int, Any] = {}
+    page = 1
+    while True:
+        d = _api("GET", "review-sessions", params={"instruction": instruction_id, "page": page})
+        for s in d.get("review-sessions", []):
+            sessions.append(s)
+            session_by_id[s["id"]] = s
+            sub_id = s.get("submission")
+            if sub_id and s.get("is_taking_finished"):
+                graded_subs.add(sub_id)
+        for s in d.get("submissions", []):
+            submissions[s["id"]] = s
+        if not d.get("meta", {}).get("has_next"):
+            break
+        page += 1
+    return {
+        "sessions": sessions,
+        "submissions": submissions,
+        "graded_subs": graded_subs,
+        "session_by_id": session_by_id,
+    }
+
+
+@mcp.tool()
+def stepik_get_review_step(step_id: int) -> str:
+    """
+    Inspect an instructor-reviewed step before grading: the task statement,
+    the rubric criteria with their max scores, and how many submissions are
+    pending vs already graded. Use this first to learn what to grade against.
+    """
+    ctx = _step_review_context(step_id)
+    state = _instruction_review_state(ctx["instruction_id"])
+    pending = graded = 0
+    for s in state["sessions"]:
+        sub_id = s.get("submission")
+        if not sub_id:
+            continue  # instructor session
+        if sub_id in state["graded_subs"]:
+            graded += 1
+        else:
+            pending += 1
+    rubrics = [
+        {"rubric_id": r["id"], "position": r.get("position", 0),
+         "max_score": r.get("cost", 0), "text": _strip_html(r.get("text", "")) or "(no description)"}
+        for r in ctx["rubrics"]
+    ]
+    total_max = sum(r["max_score"] for r in rubrics)
+    return json.dumps({
+        "step_id": step_id,
+        "statement": ctx["statement"],
+        "criteria": rubrics,
+        "max_total_score": total_max,
+        "pending_count": pending,
+        "graded_count": graded,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def stepik_list_submissions_to_review(step_id: int, include_graded: bool = False, limit: int = 30) -> str:
+    """
+    List student submissions on an instructor-reviewed step.
+
+    By default returns only submissions still awaiting review (pending).
+    Each entry includes submission_id (pass it to stepik_review_submission),
+    the student's user id, the submission time, and the answer text.
+    """
+    ctx = _step_review_context(step_id)
+    state = _instruction_review_state(ctx["instruction_id"])
+    rows = []
+    for s in sorted(state["sessions"], key=lambda x: x.get("submission") or 0):
+        sub_id = s.get("submission")
+        if not sub_id:
+            continue
+        is_graded = sub_id in state["graded_subs"]
+        if is_graded and not include_graded:
+            continue
+        sub = state["submissions"].get(sub_id, {})
+        reply = sub.get("reply", {}) or {}
+        entry = {
+            "submission_id": sub_id,
+            "status": "graded" if is_graded else "pending",
+            "session_score": s.get("score"),
+            "time": sub.get("time"),
+            "answer": _strip_html(reply.get("text", "")),
+        }
+        rows.append(entry)
+        if len(rows) >= limit:
+            break
+    if not rows:
+        return f"No {'submissions' if include_graded else 'pending submissions'} on step {step_id}."
+    header = (f"Step {step_id} — {len(rows)} submission(s) "
+              f"({'incl. graded' if include_graded else 'pending only'}):\n")
+    return header + json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def stepik_get_submission(submission_id: int) -> str:
+    """
+    Get one submission with everything needed to grade it: the student's answer,
+    the task statement, and the rubric criteria with max scores. Use before
+    stepik_review_submission when grading a single answer.
+    """
+    sub = _api("GET", f"submissions/{submission_id}")["submissions"][0]
+    att = _api("GET", f"attempts/{sub['attempt']}")["attempts"][0]
+    ctx = _step_review_context(att["step"])
+    state = _instruction_review_state(ctx["instruction_id"])
+    reply = sub.get("reply", {}) or {}
+    rubrics = [
+        {"rubric_id": r["id"], "max_score": r.get("cost", 0),
+         "text": _strip_html(r.get("text", "")) or "(no description)"}
+        for r in ctx["rubrics"]
+    ]
+    return json.dumps({
+        "submission_id": submission_id,
+        "step_id": att["step"],
+        "student_user_id": att.get("user"),
+        "time": sub.get("time"),
+        "already_graded": submission_id in state["graded_subs"],
+        "statement": ctx["statement"],
+        "criteria": rubrics,
+        "max_total_score": sum(r["max_score"] for r in rubrics),
+        "answer": _strip_html(reply.get("text", "")),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def stepik_review_submission(
+    submission_id: int,
+    scores: list[int],
+    feedback: str = "",
+    criterion_feedback: list[str] | None = None,
+    overwrite: bool = False,
+) -> str:
+    """
+    Grade an instructor-reviewed submission and submit the review (final — the
+    score is delivered to the student).
+
+    - scores: one integer per rubric criterion, in criterion order (see
+      stepik_get_submission). Each must be 0..max_score for that criterion.
+      For a single-criterion task pass a one-element list, e.g. [4].
+    - feedback: general comment for the student (plain text or HTML).
+    - criterion_feedback: optional per-criterion explanations, same order/length
+      as scores.
+    - overwrite: if the submission was already graded, set True to grade anyway
+      (otherwise the call refuses to avoid double-grading).
+
+    Returns the awarded total and a confirmation.
+    """
+    # Resolve step / instruction / rubrics / instructor session from the submission.
+    sub = _api("GET", f"submissions/{submission_id}")["submissions"][0]
+    att = _api("GET", f"attempts/{sub['attempt']}")["attempts"][0]
+    ctx = _step_review_context(att["step"])
+    rubrics = ctx["rubrics"]
+
+    if len(scores) != len(rubrics):
+        crit = [f"#{i+1} (max {r.get('cost', 0)})" for i, r in enumerate(rubrics)]
+        return (f"Expected {len(rubrics)} score(s), got {len(scores)}. "
+                f"Criteria: {', '.join(crit)}.")
+    for i, (sc, r) in enumerate(zip(scores, rubrics)):
+        cap = r.get("cost", 0)
+        if not isinstance(sc, int) or sc < 0 or sc > cap:
+            return f"Score for criterion #{i+1} must be an integer 0..{cap}, got {sc}."
+
+    state = _instruction_review_state(ctx["instruction_id"])
+    if submission_id in state["graded_subs"] and not overwrite:
+        return (f"Submission {submission_id} is already graded. "
+                f"Pass overwrite=True to grade it again.")
+
+    # 1. Create the draft review under the instructor session. If this step was
+    #    never opened for review, no instructor session exists yet — create one.
+    instructor_session = ctx["instructor_session"]
+    if not instructor_session:
+        sess = _api("POST", "review-sessions", {
+            "review-session": {"instruction": ctx["instruction_id"]}
+        })
+        instructor_session = sess["review-sessions"][0]["id"]
+    created = _api("POST", "reviews", {
+        "review": {"session": instructor_session, "submission": submission_id}
+    })
+    review = created["reviews"][0]
+    review_id = review["id"]
+
+    # Pull rubric-score objects (auto-created, one per rubric) and map by rubric id.
+    rs_objs = created.get("rubric-scores")
+    if not rs_objs:
+        full = _api("GET", f"reviews/{review_id}")
+        rs_objs = full.get("rubric-scores", [])
+    rs_by_rubric = {rs["rubric"]: rs for rs in rs_objs}
+
+    # 2. Write each criterion score (+ optional per-criterion text).
+    for i, r in enumerate(rubrics):
+        rs = rs_by_rubric.get(r["id"])
+        if not rs:
+            return f"Review {review_id} created but no rubric-score for rubric {r['id']}; aborted before finalizing."
+        patch = {"score": scores[i]}
+        if criterion_feedback and i < len(criterion_feedback) and criterion_feedback[i]:
+            patch["text"] = criterion_feedback[i]
+        _api("PUT", f"rubric-scores/{rs['id']}", {"rubric-score": patch})
+
+    # 3. Finalize (freeze) the review.
+    finalize: dict[str, Any] = {"is_frozen": True}
+    if feedback:
+        finalize["text"] = feedback
+    _api("PUT", f"reviews/{review_id}", {"review": finalize})
+
+    total = sum(scores)
+    max_total = sum(r.get("cost", 0) for r in rubrics)
+    return (f"Reviewed submission {submission_id}: {total}/{max_total} "
+            f"(criteria: {scores}). Review {review_id} submitted.")
+
+
+@mcp.tool()
+def stepik_list_review_queue(
+    course_id: int | None = None,
+    section_id: int | None = None,
+    show_empty: bool = False,
+) -> str:
+    """
+    Scan a course (or a single section) for instructor-reviewed steps and report
+    how many submissions await review on each — the API equivalent of the
+    "Проверка решений" page.
+
+    Provide section_id to scan one module (fast), or course_id to scan the whole
+    course (slower: one request per lesson). By default only steps with pending
+    submissions are listed; set show_empty=True to include zero-pending steps.
+    """
+    if not course_id and not section_id:
+        return "Provide course_id or section_id."
+
+    if section_id:
+        section_ids = [section_id]
+    else:
+        course = _api("GET", f"courses/{course_id}")["courses"][0]
+        section_ids = course.get("sections", [])
+
+    results = []
+    total_pending = 0
+    for sid in section_ids:
+        section = _api("GET", f"sections/{sid}")["sections"][0]
+        unit_ids = section.get("units", [])
+        # Resolve units -> lessons in bulk.
+        lesson_ids = []
+        for i in range(0, len(unit_ids), 100):
+            chunk = unit_ids[i:i + 100]
+            ur = _api("GET", "units", params={"ids[]": chunk})
+            lesson_ids.extend(u["lesson"] for u in ur.get("units", []))
+        for lid in lesson_ids:
+            steps = _api("GET", "steps", params={"lesson": lid}).get("steps", [])
+            for st in steps:
+                if st.get("instruction_type") != "instructor" or not st.get("instruction"):
+                    continue
+                state = _instruction_review_state(st["instruction"])
+                pending = sum(
+                    1 for s in state["sessions"]
+                    if s.get("submission") and s["submission"] not in state["graded_subs"]
+                )
+                total_pending += pending
+                if pending or show_empty:
+                    results.append({
+                        "section": section["title"],
+                        "step_id": st["id"],
+                        "position": st.get("position"),
+                        "pending": pending,
+                    })
+
+    if not results:
+        return f"No pending reviews found (total pending: {total_pending})."
+    results.sort(key=lambda r: -r["pending"])
+    header = f"{total_pending} submission(s) awaiting review across {len(results)} step(s):\n"
+    return header + json.dumps(results, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

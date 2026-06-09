@@ -2,7 +2,7 @@
 
 MCP server for managing [Stepik](https://stepik.org) courses from Claude Code, Cursor, or any MCP-compatible client.
 
-## 20 Tools
+## 25 Tools
 
 | Category | Tools |
 |----------|-------|
@@ -10,8 +10,26 @@ MCP server for managing [Stepik](https://stepik.org) courses from Claude Code, C
 | **Sections** | `stepik_get_sections`, `stepik_create_section`, `stepik_update_section`, `stepik_delete_section` |
 | **Lessons** | `stepik_get_lessons`, `stepik_get_lesson`, `stepik_create_lesson`, `stepik_update_lesson`, `stepik_delete_lesson` |
 | **Units** | `stepik_create_unit` |
-| **Steps** | `stepik_get_steps`, `stepik_create_text_step`, `stepik_update_text_step`, `stepik_create_quiz_step` |
+| **Steps** | `stepik_get_steps`, `stepik_create_text_step`, `stepik_update_text_step`, `stepik_create_quiz_step`, `stepik_create_free_answer_step` |
+| **Grading** | `stepik_list_review_queue`, `stepik_get_review_step`, `stepik_list_submissions_to_review`, `stepik_get_submission`, `stepik_review_submission` |
 | **Health** | `stepik_health_check` |
+
+## Grading instructor-reviewed tasks
+
+For steps that are "рецензируется преподавателем" (manual instructor review),
+the AI can read pending student answers and submit scored reviews:
+
+```
+stepik_list_review_queue(course_id)         → which steps have submissions waiting
+stepik_get_review_step(step_id)             → task statement + rubric criteria + max scores
+stepik_list_submissions_to_review(step_id)  → pending submissions (id + answer text)
+stepik_get_submission(submission_id)        → one answer + statement + rubric, ready to judge
+stepik_review_submission(submission_id, scores=[4], feedback="...")  → grade & submit (final)
+```
+
+`scores` is one integer per rubric criterion (`0..max_score`). `stepik_review_submission`
+is **final** — the score is delivered to the student — so judge against the rubric first.
+It refuses to re-grade an already-graded submission unless `overwrite=True`.
 
 ## Quick Start
 
