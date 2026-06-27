@@ -436,6 +436,8 @@ def stepik_create_free_answer_step(
     cost: int = 1,
     max_submissions_count: int | None = 5,
     review_criteria: list[str] | None = None,
+    instructor_review: bool = True,
+    review_max_score: int = 5,
 ) -> str:
     """
     Create a free-answer step (open-text answer, manually reviewed).
@@ -448,7 +450,10 @@ def stepik_create_free_answer_step(
     - is_attachments_enabled=True: allow students to attach files.
     - cost: points awarded for the task (default 1).
     - max_submissions_count: max attempts (default 5; None = unlimited).
-    - review_criteria: list of textual criteria for peer/manual review.
+    - review_criteria: list of rubric criteria texts (one rubric each).
+    - instructor_review: attach teacher review (instruction + rubric). Without it a
+      free-answer step has NO grading ("Любой ответ будет верным"). Default True.
+    - review_max_score: max score per rubric criterion (default 5).
     """
     body = {
         "step-source": {
@@ -474,20 +479,39 @@ def stepik_create_free_answer_step(
     s = result["step-sources"][0]
     source_id = s["id"]
 
-    crit_count = 0
-    if review_criteria:
-        for text in review_criteria:
-            try:
-                # criteria endpoint TBD; keeping shim so call signature works
-                _api("POST", "review-criteria", {
-                    "review-criterion": {"step_source": source_id, "text": text}
+    # Set up instructor (teacher) review. A bare free-answer step-source has NO
+    # grading attached -> the UI shows "Любой ответ будет верным" and nothing lands
+    # in the review queue. Instructor review needs a separate `instruction`
+    # (strategy_type="instructor") plus at least one `rubric` whose `cost` is the
+    # max score. Without this, recreated free-answer steps silently become ungraded.
+    review_on = False
+    if instructor_review and manual_scoring:
+        criteria = review_criteria or ["."]
+        try:
+            instr = _api("POST", "instructions", {
+                "instruction": {
+                    "step": s.get("step") or source_id,
+                    "min_reviews": 1,
+                    "strategy_type": "instructor",
+                    "text": "",
+                }
+            })
+            instruction_id = instr["instructions"][0]["id"]
+            for i, text in enumerate(criteria, 1):
+                _api("POST", "rubrics", {
+                    "rubric": {
+                        "instruction": instruction_id,
+                        "text": text,
+                        "cost": review_max_score,
+                        "position": i,
+                    }
                 })
-                crit_count += 1
-            except Exception as e:
-                return (
-                    f"Free-answer step created: ID={source_id} (lesson {lesson_id}, pos {position}); "
-                    f"but failed to add review criterion: {e}"
-                )
+            review_on = True
+        except Exception as e:
+            return (
+                f"Free-answer step created: ID={source_id} (lesson {lesson_id}, pos {position}); "
+                f"but failed to set up instructor review: {e}"
+            )
 
     extras = []
     if max_submissions_count is not None:
@@ -495,11 +519,112 @@ def stepik_create_free_answer_step(
     extras.append(f"cost={cost}")
     if has_review:
         extras.append("peer_review=on")
-    if crit_count:
-        extras.append(f"criteria={crit_count}")
+    if review_on:
+        extras.append(f"instructor_review=on(max={review_max_score})")
     return (
         f"Free-answer step created: ID={source_id} in lesson {lesson_id} at position {position} "
         f"({', '.join(extras)})"
+    )
+
+
+# Exact source schema for a "string" (text) quiz whose answer is graded by code.
+# Discovered empirically against the Stepik step-sources endpoint: these are the
+# only keys the validator accepts, and all are required. A non-empty `code`
+# switches grading to the Python checker (check(reply) -> bool, optional solve()).
+def _string_code_source(
+    checker_code: str,
+    use_re: bool = False,
+    case_sensitive: bool = False,
+    pattern: str = "",
+    match_substring: bool = False,
+) -> dict:
+    return {
+        "code": checker_code,
+        "use_re": use_re,
+        "case_sensitive": case_sensitive,
+        "pattern": pattern,
+        "match_substring": match_substring,
+    }
+
+
+@mcp.tool()
+def stepik_create_string_code_step(
+    lesson_id: int,
+    text_html: str,
+    checker_code: str,
+    position: int = 1,
+    cost: int = 1,
+) -> str:
+    """
+    Create a text-answer step graded by a custom Python checker.
+
+    The student types a free-form text answer; grading is done by `checker_code`,
+    which must define `def check(reply) -> bool` (and may define `def solve()`
+    returning the correct answer shown on "give up"). This is Stepik's "string"
+    quiz in code-checker mode — use it for open-ended tasks that can still be
+    auto-graded by comparing/normalizing the reply.
+
+    - text_html: the task statement (HTML).
+    - checker_code: Python source with check(reply); e.g.
+        ANSWER = "1\\n2"
+        def check(reply): return reply.strip() == ANSWER
+        def solve(): return ANSWER
+    - cost: points awarded (default 1).
+    """
+    body = {
+        "step-source": {
+            "lesson": lesson_id,
+            "position": position,
+            "cost": cost,
+            "block": {
+                "name": "string",
+                "text": text_html,
+                "source": _string_code_source(checker_code),
+            },
+        }
+    }
+    s = _api("POST", "step-sources", body)["step-sources"][0]
+    return f"String/code step created: ID={s['id']} in lesson {lesson_id} at position {position}"
+
+
+@mcp.tool()
+def stepik_convert_step_to_string_code(
+    step_source_id: int,
+    checker_code: str,
+    text_html: str | None = None,
+) -> str:
+    """
+    Convert an existing step into a text-answer step graded by Python code.
+
+    Changes the block of step-source `step_source_id` to a "string" quiz in
+    code-checker mode, in place (same ID and position preserved). Use this to
+    replace selected steps (e.g. free-answer ones) with auto-graded tasks
+    without recreating them. Only the steps you pass are touched.
+
+    - step_source_id: the step-source to convert (its block type changes to "string").
+    - checker_code: Python source with check(reply) (see stepik_create_string_code_step).
+    - text_html: new statement HTML; if omitted, the existing text is kept.
+
+    Note: changing a step's type detaches existing submissions for that step.
+    """
+    current = _api("GET", f"step-sources/{step_source_id}")["step-sources"][0]
+    block = current["block"]
+    body = {
+        "step-source": {
+            "id": step_source_id,
+            "lesson": current["lesson"],
+            "position": current["position"],
+            "block": {
+                "name": "string",
+                "text": text_html if text_html is not None else block.get("text", ""),
+                "source": _string_code_source(checker_code),
+            },
+        }
+    }
+    s = _api("PUT", f"step-sources/{step_source_id}", body)["step-sources"][0]
+    return (
+        f"Step-source {step_source_id} converted to string/code "
+        f"(lesson {s['lesson']}, position {s['position']})"
     )
 
 
